@@ -1,0 +1,17 @@
+# Orchestration (LangChain 1.x agent + LangGraph memory)
+langchain>=1.5,<2.0
+langchain-core>=1.8,<2.0
+langgraph>=1.2,<2.0
+langchain-ollama>=1.1,<2.0
+langchain-openai>=1.8,<2.0
+
+# Knowledge vault (LlamaIndex RAG)
+llama-index-core>=0.14.26,<0.15
+llama-index-embeddings-ollama>=0.11,<0.12
+llama-index-llms-ollama>=0.12,<0.13
+llama-index-embeddings-openai>=0.8,<0.9
+llama-index-llms-openai>=0.9,<0.10
+
+# Config and testing
+python-dotenv>=1.2,<2.0
+pytest>=9.0,<10.0
