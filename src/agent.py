@@ -15,13 +15,19 @@ import re
 from dataclasses import dataclass, field
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware, ToolCallRequest, wrap_tool_call
+from langchain.agents.middleware import (
+    SummarizationMiddleware,
+    ToolCallLimitMiddleware,
+    ToolCallRequest,
+    wrap_tool_call,
+)
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
 
 import ai_config
 from knowledge_vault import NOT_FOUND, search_afyaplus_guidelines
-from tools import MATH_TOOLS
+from tools import calculate_weight_based_dose
 
 SYSTEM_PROMPT = f"""You are the AfyaPlus Health assistant for insurance verification and clinic routing.
 
@@ -30,8 +36,8 @@ STRICT RULES:
    triage or medication doses, call the search_afyaplus_guidelines tool first.
 2. Answer ONLY from tool results. Never invent or guess a dose, limit, price or policy rule.
 3. For a medication dose, call calculate_weight_based_dose with the medication name and the
-   patient's weight in kg. It looks up the official dosing values itself. For BMI, call
-   calculate_bmi. Never do arithmetic yourself; report the tool's numbers exactly.
+   patient's weight in kg. It looks up the official dosing values itself.
+   Never do arithmetic yourself; report the tool's numbers exactly.
 4. If the guidelines tool returns "{NOT_FOUND}", reply with exactly that sentence and nothing
    else about the topic.
 5. End every guideline-based answer with the "Sources:" line from the tool result.
@@ -47,8 +53,12 @@ STRICT RULES:
    department immediately.
 9. Be brief and clear. This is a training system, not a substitute for a clinician."""
 
-TOOLS = [search_afyaplus_guidelines, *MATH_TOOLS]
-MATH_TOOL_NAMES = {t.name for t in MATH_TOOLS}
+# calculate_bmi is kept in tools.py (tested) but not given to the agent: llama3.2 kept
+# inventing BMI calls on unrelated turns. One maths tool = no tool confusion.
+TOOLS = [search_afyaplus_guidelines, calculate_weight_based_dose]
+MAX_AGENT_STEPS = 12          # ~5 tool round-trips per turn is plenty for these questions
+MAX_TOOL_CALLS_PER_TURN = 5
+MATH_TOOL_NAMES = {calculate_weight_based_dose.name, "calculate_bmi"}
 
 
 def _number_in_text(value: float, text: str) -> bool:
@@ -79,8 +89,9 @@ def argument_grounding_guard(request: ToolCallRequest, handler):
             if not _number_in_text(number, patient_text):
                 return ToolMessage(
                     content=(
-                        f"Error: {arg}={value} was not provided by the patient. Do not guess "
-                        "values - ask the patient for it, or answer without this tool."
+                        f"Error: {arg}={value} was not provided by the patient, so this call "
+                        "was blocked. STOP calling tools for this question. Reply to the "
+                        "patient now using the conversation so far, or ask them for the value."
                     ),
                     tool_call_id=call["id"],
                     name=call["name"],
@@ -98,6 +109,9 @@ def build_agent(checkpointer: InMemorySaver | None = None):
         checkpointer=checkpointer or InMemorySaver(),
         middleware=[
             argument_grounding_guard,
+            # Backstop: at most 5 tool calls per turn; extra calls are refused with an error
+            # message and the model must answer with what it has.
+            ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS_PER_TURN, exit_behavior="continue"),
             # When a thread passes ~3k tokens, older turns are replaced by a summary and the
             # last 6 messages are kept verbatim. Summaries are built from masked text only.
             SummarizationMiddleware(model=model, trigger=("tokens", 3000), keep=("messages", 6)),
@@ -113,8 +127,22 @@ class AgentTurn:
 
 def run_turn(agent, thread_id: str, masked_text: str) -> AgentTurn:
     """Send one masked user message on a patient's thread and return the masked reply."""
-    config = {"configurable": {"thread_id": thread_id}}
-    result = agent.invoke({"messages": [HumanMessage(masked_text)]}, config=config)
+    # recursion_limit caps agent steps per turn (LangGraph's default is ~10,000), so a
+    # model stuck retrying a blocked tool cannot loop forever.
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": MAX_AGENT_STEPS}
+    try:
+        result = agent.invoke({"messages": [HumanMessage(masked_text)]}, config=config)
+    except GraphRecursionError:
+        return AgentTurn(
+            answer="Sorry, I couldn't complete that request safely. Please rephrase or contact "
+            "the AfyaPlus help desk.",
+            tool_calls=[f"stopped after {MAX_AGENT_STEPS} agent steps"],
+        )
+    except Exception as exc:  # e.g. model server down or timed out
+        return AgentTurn(
+            answer="Sorry, the assistant is temporarily unavailable. Please try again shortly.",
+            tool_calls=[f"error: {type(exc).__name__}"],
+        )
     messages = result["messages"]
 
     # Only look at messages produced in THIS turn (after the last human message).
@@ -143,8 +171,9 @@ def run_turn(agent, thread_id: str, masked_text: str) -> AgentTurn:
         answer = NOT_FOUND
 
     # Tidy-up: small models sometimes emit "{}" or an empty/"None" Sources line.
+    # A reply that is raw JSON is a tool call the model wrote as text - never show it.
     answer = answer.strip()
-    if answer in {"{}", "[]", "null"}:
+    if answer in {"null"} or (answer.startswith(("{", "[")) and answer.endswith(("}", "]"))):
         answer = ""
     answer = re.sub(r"\n*Sources:\s*(None|N/A|\[\])?\s*$", "", answer, flags=re.I)
     answer = re.sub(r"Sources:\s*\[([^\]]+)\]", r"Sources: \1", answer)
@@ -161,4 +190,5 @@ def run_turn(agent, thread_id: str, masked_text: str) -> AgentTurn:
     if answer and cited and answer != NOT_FOUND and "Sources:" not in answer:
         answer += f"\n\nSources: {', '.join(cited)}"
 
-    return AgentTurn(answer=answer or "Sorry, I could not produce an answer.", tool_calls=calls)
+    fallback = "Sorry, I couldn't answer that. Could you rephrase your question?"
+    return AgentTurn(answer=answer or fallback, tool_calls=calls)

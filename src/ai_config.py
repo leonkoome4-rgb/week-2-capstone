@@ -34,6 +34,10 @@ TEMPERATURE = 0.0
 # 3 retrieved chunks + short history) stay well under 4k tokens, so 8k is plenty.
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
+# Hard limits so one bad generation can never hang the system.
+MAX_OUTPUT_TOKENS = 1024     # answers here are a few sentences; 1k is generous
+REQUEST_TIMEOUT_S = 120.0    # per model call
+
 
 def _require_openai_key() -> None:
     key = os.getenv("OPENAI_API_KEY", "")
@@ -47,7 +51,12 @@ def get_chat_model():
         _require_openai_key()
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model=OPENAI_CHAT_MODEL, temperature=TEMPERATURE)
+        return ChatOpenAI(
+            model=OPENAI_CHAT_MODEL,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            timeout=REQUEST_TIMEOUT_S,
+        )
 
     from langchain_ollama import ChatOllama
 
@@ -56,6 +65,8 @@ def get_chat_model():
         base_url=OLLAMA_BASE_URL,
         temperature=TEMPERATURE,
         num_ctx=OLLAMA_NUM_CTX,
+        num_predict=MAX_OUTPUT_TOKENS,          # stop runaway generations
+        client_kwargs={"timeout": REQUEST_TIMEOUT_S},
     )
 
 

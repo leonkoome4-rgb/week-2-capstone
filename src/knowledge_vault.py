@@ -123,7 +123,7 @@ def query_guidelines(question: str) -> str:
     return f"{answer}\nSources: {', '.join(sources)}"
 
 
-@tool
+@tool(parse_docstring=True)
 def search_afyaplus_guidelines(query: str) -> str:
     """Search the official AfyaPlus guidelines (insurance cover, waiting periods, exclusions,
     pre-authorisation, clinic referral and triage rules, medication dosing values, BMI bands).
@@ -140,5 +140,5 @@ def search_afyaplus_guidelines(query: str) -> str:
             return "Error: query must not be empty."
         return query_guidelines(query.strip())
     except Exception as exc:  # e.g. Ollama not running - report, don't crash the agent
-        logger.error("Guideline search failed: %s", exc)
+        logger.error("Guideline search failed: %s", type(exc).__name__)  # no message: may echo input
         return f"Error: the guidelines service is unavailable ({type(exc).__name__})."
