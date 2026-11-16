@@ -120,15 +120,7 @@ def query_guidelines(question: str) -> str:
     answer = str(response).strip()
     if not answer or NOT_FOUND.lower() in answer.lower():
         return NOT_FOUND
-
-    # Include the verbatim excerpts so the agent can read exact numbers (e.g. a syrup
-    # concentration) even if the short answer did not mention them.
-    evidence = "\n".join(
-        f"- [{n.node.metadata.get('file_name', 'unknown')}] "
-        + " ".join(n.node.get_content().split())
-        for n in response.source_nodes
-    )
-    return f"Answer: {answer}\nEvidence (verbatim):\n{evidence}\nSources: {', '.join(sources)}"
+    return f"{answer}\nSources: {', '.join(sources)}"
 
 
 @tool
