@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware
+from langchain.agents.middleware import SummarizationMiddleware, ToolCallRequest, wrap_tool_call
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -39,14 +39,53 @@ STRICT RULES:
 6. Questions about this conversation itself (e.g. "what did I tell you?", "which plan am I
    on?") are answered from the chat history WITHOUT calling any tool. If the patient never
    told you something, say so.
-7. Text like [MASKED_PHONE_1] or [MASKED_EMAIL_1] is a privacy placeholder for the patient's
-   real contact details. Repeat a placeholder exactly as written when you need to refer to it.
-   Never try to guess or reconstruct the real value.
+7. Phone numbers and emails appear as codes like [MASKED_PHONE_1] or [MASKED_EMAIL_1].
+   Treat each code as the real value itself. Example: patient said "my phone is
+   [MASKED_PHONE_1]" and later asks for their number -> answer "Your phone number is
+   [MASKED_PHONE_1]." Copy codes exactly. Never comment on the codes or call them placeholders.
 8. If the patient describes an emergency red flag, tell them to go to the nearest emergency
    department immediately.
 9. Be brief and clear. This is a training system, not a substitute for a clinician."""
 
 TOOLS = [search_afyaplus_guidelines, *MATH_TOOLS]
+MATH_TOOL_NAMES = {t.name for t in MATH_TOOLS}
+
+
+def _number_in_text(value: float, text: str) -> bool:
+    """True if `value` (e.g. 18.0) appears as a number in `text` (e.g. "weighs 18 kg")."""
+    for match in re.findall(r"\d+(?:[.,]\d+)?", text):
+        if abs(float(match.replace(",", ".")) - value) < 1e-9:
+            return True
+    return False
+
+
+@wrap_tool_call
+def argument_grounding_guard(request: ToolCallRequest, handler):
+    """Block maths-tool calls whose numbers were never given by the patient.
+
+    Small models sometimes invent a weight or height "to be helpful". Every numeric argument
+    to a maths tool must appear in something the patient actually typed on this thread.
+    """
+    call = request.tool_call
+    if call["name"] in MATH_TOOL_NAMES:
+        patient_text = " ".join(
+            str(m.content) for m in request.state["messages"] if isinstance(m, HumanMessage)
+        )
+        for arg, value in call["args"].items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue  # non-numeric args (e.g. medication name) are validated by the tool
+            if not _number_in_text(number, patient_text):
+                return ToolMessage(
+                    content=(
+                        f"Error: {arg}={value} was not provided by the patient. Do not guess "
+                        "values - ask the patient for it, or answer without this tool."
+                    ),
+                    tool_call_id=call["id"],
+                    name=call["name"],
+                )
+    return handler(request)
 
 
 def build_agent(checkpointer: InMemorySaver | None = None):
@@ -58,6 +97,7 @@ def build_agent(checkpointer: InMemorySaver | None = None):
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer or InMemorySaver(),
         middleware=[
+            argument_grounding_guard,
             # When a thread passes ~3k tokens, older turns are replaced by a summary and the
             # last 6 messages are kept verbatim. Summaries are built from masked text only.
             SummarizationMiddleware(model=model, trigger=("tokens", 3000), keep=("messages", 6)),
@@ -81,8 +121,10 @@ def run_turn(agent, thread_id: str, masked_text: str) -> AgentTurn:
     last_human = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
     this_turn = messages[last_human + 1 :]
 
+    results = {m.tool_call_id: str(m.content) for m in this_turn if isinstance(m, ToolMessage)}
     calls = [
         f"{c['name']}({c['args']})"
+        + (" -> BLOCKED/ERROR" if results.get(c["id"], "").startswith("Error:") else "")
         for m in this_turn
         if isinstance(m, AIMessage)
         for c in m.tool_calls
@@ -100,7 +142,23 @@ def run_turn(agent, thread_id: str, masked_text: str) -> AgentTurn:
     if guideline_results and all(r == NOT_FOUND for r in guideline_results) and NOT_FOUND not in answer:
         answer = NOT_FOUND
 
-    # Tidy-up: drop an empty trailing "Sources:" line (no citation = no Sources line).
-    answer = re.sub(r"\n*Sources:\s*$", "", answer.strip())
+    # Tidy-up: small models sometimes emit "{}" or an empty/"None" Sources line.
+    answer = answer.strip()
+    if answer in {"{}", "[]", "null"}:
+        answer = ""
+    answer = re.sub(r"\n*Sources:\s*(None|N/A|\[\])?\s*$", "", answer, flags=re.I)
+    answer = re.sub(r"Sources:\s*\[([^\]]+)\]", r"Sources: \1", answer)
+
+    # Deterministic citations: if a tool cited sources but the model dropped the line,
+    # add it back so every grounded answer is traceable to its documents.
+    cited = sorted({
+        name.strip()
+        for m in this_turn
+        if isinstance(m, ToolMessage)
+        for line in re.findall(r"Sources:\s*(.+)", str(m.content))
+        for name in line.split(",")
+    })
+    if answer and cited and answer != NOT_FOUND and "Sources:" not in answer:
+        answer += f"\n\nSources: {', '.join(cited)}"
 
     return AgentTurn(answer=answer or "Sorry, I could not produce an answer.", tool_calls=calls)
