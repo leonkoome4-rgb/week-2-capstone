@@ -29,6 +29,11 @@ OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 # temperature 0 = most deterministic answers; we want facts, not creativity.
 TEMPERATURE = 0.0
 
+# Context window for local models. llama3.2 defaults to 131k tokens, which needs ~18 GB of
+# RAM and spills onto the CPU on a 16 GB laptop. Our prompts (system prompt + tool schemas +
+# 3 retrieved chunks + short history) stay well under 4k tokens, so 8k is plenty.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+
 
 def _require_openai_key() -> None:
     key = os.getenv("OPENAI_API_KEY", "")
@@ -46,7 +51,12 @@ def get_chat_model():
 
     from langchain_ollama import ChatOllama
 
-    return ChatOllama(model=OLLAMA_CHAT_MODEL, base_url=OLLAMA_BASE_URL, temperature=TEMPERATURE)
+    return ChatOllama(
+        model=OLLAMA_CHAT_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        temperature=TEMPERATURE,
+        num_ctx=OLLAMA_NUM_CTX,
+    )
 
 
 def configure_llamaindex() -> None:
@@ -65,11 +75,19 @@ def configure_llamaindex() -> None:
     from llama_index.embeddings.ollama import OllamaEmbedding
     from llama_index.llms.ollama import Ollama
 
-    Settings.embed_model = OllamaEmbedding(model_name=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+    # nomic-embed-text was trained with task prefixes; using them improves retrieval.
+    nomic = "nomic" in OLLAMA_EMBED_MODEL
+    Settings.embed_model = OllamaEmbedding(
+        model_name=OLLAMA_EMBED_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        query_instruction="search_query: " if nomic else None,
+        text_instruction="search_document: " if nomic else None,
+    )
     Settings.llm = Ollama(
         model=OLLAMA_CHAT_MODEL,
         base_url=OLLAMA_BASE_URL,
         temperature=TEMPERATURE,
+        context_window=OLLAMA_NUM_CTX,
         request_timeout=180.0,
     )
 
